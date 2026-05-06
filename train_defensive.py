@@ -30,15 +30,15 @@ from features import (
     FORWARD_HORIZON,
     INDEX_CSI500_PARQUET,
     PRICES_CSI500_PARQUET,
-    SEARCHLIGHT_SLOPE_COLUMNS,
+    SEARCHLIGHT_COLUMNS,
     build_features,
     filter_prices_to_csi500_constituents,
     _replace_inf_nan_features,
 )
 from regime import REGIME_FEATURE_COLUMNS
 
-# Searchlight：与 baseline 一致的 3 个 ``alpha_slope_*``（见 ``SEARCHLIGHT_SLOPE_COLUMNS``）。
-DEFENSIVE_SEARCHLIGHT_COLUMNS: tuple[str, ...] = SEARCHLIGHT_SLOPE_COLUMNS
+# Searchlight：与 ``features.SEARCHLIGHT_COLUMNS`` 一致（斜率 + 加速度）。
+DEFENSIVE_SEARCHLIGHT_COLUMNS: tuple[str, ...] = SEARCHLIGHT_COLUMNS
 
 # ---------------------------------------------------------------------------
 # 防御：`features.py` **只产出**列（含扩展风险）；送进 XGB 谁用哪列由本清单决定，

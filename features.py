@@ -38,12 +38,21 @@ PRICES_CSI500_PARQUET = DATA_DIR / "prices_csi500.parquet"
 INDEX_CSI500_PARQUET = DATA_DIR / "index_csi500.parquet"
 CONSTITUENTS_CSI500_CSV = DATA_DIR / "constituents_csi500.csv"
 
-# ``alpha_searchlight.py`` 产出的滚动斜率因子（见 ``data/panel_alpha_searchlight.parquet``）。
+# ``alpha_searchlight.py`` 产出的斜率 + 加速度（见 ``panel_alpha_searchlight.parquet``）。
+# 列为训练时可能出现的全集；parquet 中未出现的列合并后为 NaN，且在 FEATURES_NA_OK 中则不影响 dropna。
 SEARCHLIGHT_SLOPE_COLUMNS: tuple[str, ...] = (
     "alpha_slope_atom_pos",
     "alpha_slope_atom_avg_trade_amt",
     "alpha_slope_atom_vol_ratio",
+    "alpha_slope_atom_ret_std_ratio",
+    "alpha_slope_atom_vol_shortlong_ratio_log",
+    "alpha_slope_atom_vol_squeeze",
+    "alpha_slope_atom_pv_corr",
 )
+SEARCHLIGHT_ACCEL_COLUMNS: tuple[str, ...] = tuple(
+    f"alpha_accel_{c.removeprefix('alpha_slope_')}" for c in SEARCHLIGHT_SLOPE_COLUMNS
+)
+SEARCHLIGHT_COLUMNS: tuple[str, ...] = SEARCHLIGHT_SLOPE_COLUMNS + SEARCHLIGHT_ACCEL_COLUMNS
 
 # Analyst 分量 / 结构上允许 NaN；has_coverage 恒为 0/1。
 # 财务块在 ``_neutral_fill_financial_panel`` 后训练路径上通常为有限值；
@@ -57,7 +66,7 @@ FEATURES_NA_OK = (
     frozenset(FINANCIAL_EXT_FEATURE_COLUMNS) - frozenset({"financial_evt_gate"})
 ) | frozenset({"financial_days_since_notice"}) | (
     frozenset(REGIME_FEATURE_COLUMNS) - frozenset({"regime_bucket"})
-) | frozenset(SEARCHLIGHT_SLOPE_COLUMNS)
+) | frozenset(SEARCHLIGHT_COLUMNS)
 
 # columns passed to XGBoost（技术 + consensus + regime + …）
 
@@ -68,12 +77,31 @@ FEATURE_COLUMNS = [
     "ret_3d_rank", "ret_5d_rank", "ret_20d_rank", "vol_20d_rank",
     # *ANALYST_FEATURE_COLUMNS,
     *REGIME_FEATURE_COLUMNS,
-    *SEARCHLIGHT_SLOPE_COLUMNS,
+    *SEARCHLIGHT_COLUMNS,
     # *FINANCIAL_FEATURE_COLUMNS,
     # *FINANCIAL_EXT_FEATURE_COLUMNS,
 ]
 TARGET_COLUMN = "target_5d"
 FORWARD_HORIZON = 5
+
+# 截面分位与 Top-K 二分类（相对强弱；非特征列）
+LABEL_CS_RANK_PCT = "target_rank_pct"
+LABEL_TOPK_BINARY = "target_topk_bin"
+
+
+def attach_cross_sectional_rank_labels(
+    panel: pd.DataFrame,
+    *,
+    top_pct_threshold: float = 0.9,
+    ret_col: str = TARGET_COLUMN,
+) -> pd.DataFrame:
+    """按交易日截面 rank(pct)；``target_topk_bin``：分位 ≥ threshold 为 1。"""
+    out = panel.copy()
+    rk = out.groupby("date", sort=False)[ret_col].rank(method="average", pct=True)
+    out[LABEL_CS_RANK_PCT] = rk
+    tb = (rk >= float(top_pct_threshold)).astype(np.float64)
+    out[LABEL_TOPK_BINARY] = tb.where(rk.notna(), np.nan)
+    return out
 
 
 def filter_prices_to_csi500_constituents(
@@ -296,16 +324,16 @@ def _cross_sectional_ranks(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def _merge_alpha_searchlight(panel: pd.DataFrame, *, data_dir: Path) -> pd.DataFrame:
-    """从 ``panel_alpha_searchlight.parquet`` 并入 Searchlight 斜率列（若缺文件则告警并填空）。"""
+    """从 ``panel_alpha_searchlight.parquet`` 并入 Searchlight 斜率 + 加速度列（若缺文件则告警并填空）。"""
     path = data_dir / "panel_alpha_searchlight.parquet"
     out = panel.copy()
-    cols = list(SEARCHLIGHT_SLOPE_COLUMNS)
+    cols = list(SEARCHLIGHT_COLUMNS)
     out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
     out["date"] = pd.to_datetime(out["date"])
 
     if not path.is_file():
         warnings.warn(
-            f"未找到 {path}，Searchlight 三列将为 NaN。生成方式: "
+            f"未找到 {path}，Searchlight 斜率/加速度列将为 NaN。生成方式: "
             f"`python alpha_searchlight.py --prices data/prices_csi500.parquet "
             f"--out-parquet {path}`",
             stacklevel=2,
@@ -364,7 +392,7 @@ def build_features(
     DataFrame with ``FEATURE_COLUMNS`` and ``TARGET_COLUMN`` populated；另含
     ``down_vol_20d`` / ``max_dd_20d`` / ``beta_20d`` / ``vol_60d`` / ``amp_20d`` /
     ``turnover_std_20d``（仅写入面板；由 ``train_defensive`` 自主选择是否使用）。
-    Searchlight：``SEARCHLIGHT_SLOPE_COLUMNS`` 自 ``panel_alpha_searchlight.parquet`` 左并入。
+    Searchlight：``SEARCHLIGHT_COLUMNS`` 自 ``panel_alpha_searchlight.parquet`` 左并入。
     """
     required = {"date", "stock_code", "close", "volume"}
     missing = required - set(prices.columns)
@@ -398,13 +426,16 @@ def build_features(
     return panel
 
 
-def training_frame(panel: pd.DataFrame, min_date=None, max_date=None) -> pd.DataFrame:
-    """Rows usable for supervised training: all features present AND target present.
-
-    Targets use ``close(t+5)``, so the last ``FORWARD_HORIZON`` trading days lack a label
-    and will not satisfy ``TARGET_COLUMN``.
-    """
-    req = _required_training_columns() + [TARGET_COLUMN]
+def training_frame(
+    panel: pd.DataFrame,
+    min_date=None,
+    max_date=None,
+    *,
+    label_column: str | None = None,
+) -> pd.DataFrame:
+    """监督行：特征齐全且标签列有限；``label_column`` 默认 ``TARGET_COLUMN``。"""
+    target_col = label_column if label_column is not None else TARGET_COLUMN
+    req = _required_training_columns() + [target_col]
     df = panel.dropna(subset=req).copy()
     if min_date is not None:
         df = df[df["date"] >= pd.Timestamp(min_date)]
