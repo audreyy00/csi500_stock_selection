@@ -25,7 +25,22 @@ import pandas as pd
 
 from features import INDEX_CSI500_PARQUET, PRICES_CSI500_PARQUET, filter_prices_to_csi500_constituents
 
-DATA_DIR = Path(__file__).parent / "data"
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+
+
+def resolve_submission_path(raw: str) -> Path:
+    """支持从项目根或纯文件名查找（常见于 CSV 放在 ``submissions/``）。"""
+    path = Path(raw).expanduser()
+    if path.is_file():
+        return path.resolve()
+    name = path.name if path.parts else raw
+    for candidate in (ROOT / path, ROOT / "submissions" / name):
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        f"找不到提交文件 {raw!r}。若在仓库里，试试: submissions/{name}"
+    )
 
 
 def _stock_return(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> tuple[float, str]:
@@ -106,7 +121,8 @@ def main():
     p.add_argument("--index", default=str(INDEX_CSI500_PARQUET))
     args = p.parse_args()
 
-    sub = pd.read_csv(args.submission, dtype={"stock_code": str})
+    sub_path = resolve_submission_path(args.submission)
+    sub = pd.read_csv(sub_path, dtype={"stock_code": str})
     sub["stock_code"] = sub["stock_code"].str.zfill(6)
     weights = sub.set_index("stock_code")["weight"].astype(float)
 

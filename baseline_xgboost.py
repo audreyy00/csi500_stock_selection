@@ -272,6 +272,7 @@ def main():
     train_end = pd.Timestamp(all_dates[-(VAL_DAYS + EMBARGO_DAYS + 1)])
     train_df = train_pool[train_pool["date"] <= train_end]
     val_df = train_pool[train_pool["date"] >= val_start]
+
     print(f"   train: {len(train_df):,} rows up to {train_end.date()}")
     print(f"   embargo: {EMBARGO_DAYS} trading days (discarded)")
     print(f"   val:   {len(val_df):,} rows from {val_start.date()}")
