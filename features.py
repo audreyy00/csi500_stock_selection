@@ -38,21 +38,38 @@ PRICES_CSI500_PARQUET = DATA_DIR / "prices_csi500.parquet"
 INDEX_CSI500_PARQUET = DATA_DIR / "index_csi500.parquet"
 CONSTITUENTS_CSI500_CSV = DATA_DIR / "constituents_csi500.csv"
 
-# ``alpha_searchlight.py`` 产出的斜率 + 加速度（见 ``panel_alpha_searchlight.parquet``）。
-# 列为训练时可能出现的全集；parquet 中未出现的列合并后为 NaN，且在 FEATURES_NA_OK 中则不影响 dropna。
+# ``alpha_searchlight.py`` 产出的斜率 + 加速度 + 斜率截面分位秩（见 ``panel_alpha_searchlight.parquet``）。
+# 与 ``prepare_atoms`` 中机制原子一一对应（未过挖掘阈值的列合并后为 NaN）。
 SEARCHLIGHT_SLOPE_COLUMNS: tuple[str, ...] = (
-    "alpha_slope_atom_pos",
-    "alpha_slope_atom_avg_trade_amt",
-    "alpha_slope_atom_vol_ratio",
-    "alpha_slope_atom_ret_std_ratio",
-    "alpha_slope_atom_vol_shortlong_ratio_log",
+    # L1
+    "alpha_slope_atom_ret_5d_accel",
+    "alpha_slope_atom_speed_bias",
+    "alpha_slope_atom_pv_corr_xsr",
+    # L2
     "alpha_slope_atom_vol_squeeze",
-    "alpha_slope_atom_pv_corr",
+    "alpha_slope_atom_avg_trade_amt",
+    "alpha_slope_atom_pos",
+    # L3
+    "alpha_slope_atom_mech_breakout",
+    "alpha_slope_atom_pullback_dry",
+    "alpha_slope_atom_ret_vol_align",
+    "alpha_slope_atom_rank_div_ret_vol",
+    # L4
+    "alpha_slope_atom_timing_trigger",
+    "alpha_slope_atom_convex_vol",
+    "alpha_slope_atom_cs_pressure2",
+    "alpha_slope_atom_cs_pressure3",
 )
+
 SEARCHLIGHT_ACCEL_COLUMNS: tuple[str, ...] = tuple(
     f"alpha_accel_{c.removeprefix('alpha_slope_')}" for c in SEARCHLIGHT_SLOPE_COLUMNS
 )
-SEARCHLIGHT_COLUMNS: tuple[str, ...] = SEARCHLIGHT_SLOPE_COLUMNS + SEARCHLIGHT_ACCEL_COLUMNS
+SEARCHLIGHT_SLOPE_RANK_COLUMNS: tuple[str, ...] = tuple(
+    f"{c}_rank" for c in SEARCHLIGHT_SLOPE_COLUMNS
+)
+SEARCHLIGHT_COLUMNS: tuple[str, ...] = (
+    SEARCHLIGHT_SLOPE_COLUMNS + SEARCHLIGHT_ACCEL_COLUMNS + SEARCHLIGHT_SLOPE_RANK_COLUMNS
+)
 
 # Analyst 分量 / 结构上允许 NaN；has_coverage 恒为 0/1。
 # 财务块在 ``_neutral_fill_financial_panel`` 后训练路径上通常为有限值；
@@ -324,7 +341,7 @@ def _cross_sectional_ranks(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def _merge_alpha_searchlight(panel: pd.DataFrame, *, data_dir: Path) -> pd.DataFrame:
-    """从 ``panel_alpha_searchlight.parquet`` 并入 Searchlight 斜率 + 加速度列（若缺文件则告警并填空）。"""
+    """从 ``panel_alpha_searchlight.parquet`` 并入 Searchlight 斜率、加速度与斜率截面分位秩列（若缺文件则告警并填空）。"""
     path = data_dir / "panel_alpha_searchlight.parquet"
     out = panel.copy()
     cols = list(SEARCHLIGHT_COLUMNS)
@@ -333,7 +350,7 @@ def _merge_alpha_searchlight(panel: pd.DataFrame, *, data_dir: Path) -> pd.DataF
 
     if not path.is_file():
         warnings.warn(
-            f"未找到 {path}，Searchlight 斜率/加速度列将为 NaN。生成方式: "
+            f"未找到 {path}，Searchlight 斜率/加速度/斜率秩列将为 NaN。生成方式: "
             f"`python alpha_searchlight.py --prices data/prices_csi500.parquet "
             f"--out-parquet {path}`",
             stacklevel=2,

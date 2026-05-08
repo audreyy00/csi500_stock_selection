@@ -3,12 +3,12 @@ AlphaSearchlight：在给定牛股池上做「原子 → 爆发前轨迹 → 斜
 
 与设计约定
 -----------
-* **原子 (atoms)**：`prepare_atoms()` 在每只股票的时间序列上计算基础量。
+* **原子**：``prepare_atoms()`` 分层写入 **14** 列机制源（黄金十 + L4 启动/凸性/截面压力），再经轨迹挖掘落成 ``alpha_slope_*``。
 * **爆发日 t₀**：在每只股票历史中取某列的最大值对应的交易日（默认 ``past_ret_5d``，无未来函数）。
   若改用 ``target_5d``（远期收益峰值）会做**窥探未来**，只适合探索性对照，不推荐用于严谨的因果叙事。
 * **轨迹**：爆发日前 ``window`` 日原子序列的 OLS 斜率；可汇总 **consistency** 或 **discriminative**
   （牛股轨迹斜率相对全市场同窗口滚动斜率分布）。
-* **因子**：``alpha_slope_<atom>`` 与 **加速度** ``alpha_accel_<atom>``（斜率沿时间的一阶差分）。
+* **因子**：``alpha_slope_<atom>``、**加速度** ``alpha_accel_<atom>``，以及按交易日的 **截面分位秩** ``alpha_slope_<atom>_rank``（pct=True）。
 
 依赖：pandas、numpy；默认读 ``data/prices_csi500.parquet``（与 baseline 一致）。
 
@@ -26,7 +26,7 @@ AlphaSearchlight：在给定牛股池上做「原子 → 爆发前轨迹 → 斜
 牛股池若在 CSI500 主库中不全：可用 ``download_extra_stocks.py`` 写入 ``prices_extended.parquet``，
 再 ``--prices`` 指向该扩展库跑一次 Searchlight。
 
-与 XGBoost 衔接：``features.SEARCHLIGHT_COLUMNS``（``alpha_slope_*`` / ``alpha_accel_*``）与 ``features.build_features`` merge 的列名对齐。
+与 XGBoost 衔接：``features.SEARCHLIGHT_COLUMNS``（``alpha_slope_*`` / ``alpha_accel_*`` / ``alpha_slope_*_rank``）与 ``features.build_features`` merge 的列名对齐。
 """
 from __future__ import annotations
 
@@ -168,7 +168,7 @@ class AlphaSearchlight:
         self.last_valid_alphas: list[str] = []
 
     def prepare_atoms(self) -> list[str]:
-        """写入原子列；返回可供挖掘 slope 一致性的原子名。"""
+        """机制分层原子：L1 动量(3)+L2 状态(3)+L3 交互(4)+L4 Timing/凸性/截面压力(4)；供挖掘。"""
         df = self.df
 
         gid = df["stock_code"]
@@ -177,41 +177,16 @@ class AlphaSearchlight:
 
         ret_1d = close_num.groupby(gid, sort=False).transform(lambda x: x.pct_change())
         df["past_ret_5d"] = close_num.groupby(gid, sort=False).transform(lambda x: x.pct_change(5))
+        df["past_ret_20d"] = close_num.groupby(gid, sort=False).transform(lambda x: x.pct_change(20))
 
-        df["atom_vol_ratio"] = vol / vol.groupby(gid).transform(
-            lambda x: x.rolling(20, min_periods=15).mean()
-        ).replace(0, np.nan)
+        vol_ma20 = vol.groupby(gid).transform(lambda x: x.rolling(20, min_periods=15).mean())
+        df["atom_vol_ratio"] = vol / vol_ma20.replace(0, np.nan)
 
-        r10 = ret_1d.groupby(gid).transform(lambda x: x.rolling(10, min_periods=8).std())
-        r60 = ret_1d.groupby(gid).transform(lambda x: x.rolling(60, min_periods=40).std())
-        df["atom_ret_std_ratio"] = r10 / r60.replace(0, np.nan)
-
-        if {"high", "low"}.issubset(df.columns):
-            hi = pd.to_numeric(df["high"], errors="coerce").astype(np.float64)
-            lo = pd.to_numeric(df["low"], errors="coerce").astype(np.float64)
-            rng = (hi - lo).replace(0, np.nan)
-            df["atom_pos"] = (close_num - lo) / (rng + 1e-9)
-        else:
-            df["atom_pos"] = np.nan
-
-        if "amount" in df.columns:
-            amt = pd.to_numeric(df["amount"], errors="coerce").astype(np.float64)
-            df["atom_avg_trade_amt"] = amt / vol.replace(0, np.nan)
-        else:
-            df["atom_avg_trade_amt"] = np.nan
-
-        r5 = ret_1d.groupby(gid, sort=False).transform(lambda x: x.rolling(5, min_periods=4).std())
-        r20 = ret_1d.groupby(gid, sort=False).transform(lambda x: x.rolling(20, min_periods=15).std())
-        ratio = r5 / r20.replace(0, np.nan)
-        df["atom_vol_shortlong_ratio_log"] = np.log(np.clip(ratio, 1e-12, np.inf))
-
-        std_s = ret_1d.groupby(gid, sort=False).transform(
-            lambda x: x.rolling(5, min_periods=4).std()
-        )
-        std_l = ret_1d.groupby(gid, sort=False).transform(
-            lambda x: x.rolling(20, min_periods=15).std()
-        )
-        df["atom_vol_squeeze"] = std_s / (std_l.replace(0, np.nan) + 1e-9)
+        # ------------------------------------------------------------
+        # L1: 核心动量
+        # ------------------------------------------------------------
+        df["atom_ret_5d_accel"] = df.groupby(gid, sort=False)["past_ret_5d"].diff()
+        df["atom_speed_bias"] = df["past_ret_5d"] - df["past_ret_20d"]
 
         df["_r1d"] = ret_1d
         pv_parts: list[pd.Series] = []
@@ -221,19 +196,88 @@ class AlphaSearchlight:
             s = s.copy()
             s.index = g.index
             pv_parts.append(s)
-        df["atom_pv_corr"] = pd.concat(pv_parts).sort_index()
-        df = df.drop(columns=["_r1d"])
+        df["_pv_corr_raw"] = pd.concat(pv_parts).sort_index()
+        df["atom_pv_corr_xsr"] = df.groupby("date", sort=False)["_pv_corr_raw"].rank(
+            method="average", pct=True
+        )
+        df = df.drop(columns=["_r1d", "_pv_corr_raw"])
+
+        # ------------------------------------------------------------
+        # L2: 状态 / 结构
+        # ------------------------------------------------------------
+        r5 = ret_1d.groupby(gid, sort=False).transform(lambda x: x.rolling(5, min_periods=4).std())
+        r20 = ret_1d.groupby(gid, sort=False).transform(lambda x: x.rolling(20, min_periods=15).std())
+        df["atom_vol_squeeze"] = r5 / (r20.replace(0, np.nan) + 1e-9)
+
+        if "amount" in df.columns:
+            amt = pd.to_numeric(df["amount"], errors="coerce").astype(np.float64)
+            df["atom_avg_trade_amt"] = amt / vol.replace(0, np.nan)
+        else:
+            df["atom_avg_trade_amt"] = np.nan
+
+        if {"high", "low"}.issubset(df.columns):
+            hi = pd.to_numeric(df["high"], errors="coerce").astype(np.float64)
+            lo = pd.to_numeric(df["low"], errors="coerce").astype(np.float64)
+            rng = (hi - lo).replace(0, np.nan)
+            df["atom_pos"] = (close_num - lo) / (rng + 1e-9)
+        else:
+            df["atom_pos"] = np.nan
+
+        # ------------------------------------------------------------
+        # L3: 门控 / 交互（连续或 0/1 浮点，避免硬标签喂模）
+        # ------------------------------------------------------------
+        ret5_nonneg = df["past_ret_5d"].clip(lower=0)
+        vol_ratio_clip = df["atom_vol_ratio"].clip(lower=0, upper=3)
+        squeeze_cond = (df["atom_vol_squeeze"] < 0.6).astype(float)
+        df["atom_mech_breakout"] = ret5_nonneg * vol_ratio_clip * squeeze_cond
+
+        df["atom_pullback_dry"] = (ret_1d < 0).astype(float) * (df["atom_vol_ratio"] < 1.0).astype(
+            float
+        )
+
+        delta_ret5 = df.groupby(gid, sort=False)["past_ret_5d"].diff()
+        delta_vol_ratio = df.groupby(gid, sort=False)["atom_vol_ratio"].diff()
+        df["atom_ret_vol_align"] = delta_ret5 * delta_vol_ratio
+
+        r_ret = df.groupby("date", sort=False)["past_ret_5d"].transform(
+            lambda s: pd.to_numeric(s, errors="coerce").rank(method="average", pct=True)
+        )
+        r_volr = df.groupby("date", sort=False)["atom_vol_ratio"].transform(
+            lambda s: pd.to_numeric(s, errors="coerce").rank(method="average", pct=True)
+        )
+        df["atom_rank_div_ret_vol"] = r_ret - r_volr
+
+        # L4: 启动检测(Timing v2) / 凸性量价 / 截面压力 2–3（r_ret,r_volr 为 past_ret_5d 与量比的截面分位秩）
+        r1n = pd.to_numeric(ret_1d, errors="coerce")
+        vr = pd.to_numeric(df["atom_vol_ratio"], errors="coerce")
+        df["atom_timing_trigger"] = (
+            r1n * (1.0 - r_ret).clip(0.0, 1.0) * (vr - 1.0).clip(0.0, 2.0)
+        )
+        df["atom_convex_vol"] = r1n * r1n.abs() * vr.clip(0.5, 2.0)
+        df["atom_cs_pressure2"] = r_ret * (1.0 - r_volr)
+        df["atom_cs_pressure3"] = (r_ret - 0.5) * (0.5 - r_volr)
 
         self.df = df
 
         slope_atoms = [
-            "atom_vol_ratio",
-            "atom_ret_std_ratio",
-            "atom_pos",
-            "atom_avg_trade_amt",
-            "atom_vol_shortlong_ratio_log",
+            # L1
+            "atom_ret_5d_accel",
+            "atom_speed_bias",
+            "atom_pv_corr_xsr",
+            # L2
             "atom_vol_squeeze",
-            "atom_pv_corr",
+            "atom_avg_trade_amt",
+            "atom_pos",
+            # L3
+            "atom_mech_breakout",
+            "atom_pullback_dry",
+            "atom_ret_vol_align",
+            "atom_rank_div_ret_vol",
+            # L4
+            "atom_timing_trigger",
+            "atom_convex_vol",
+            "atom_cs_pressure2",
+            "atom_cs_pressure3",
         ]
         self.atom_columns = [c for c in slope_atoms if c in df.columns]
         return self.atom_columns
@@ -313,10 +357,11 @@ class AlphaSearchlight:
         return disc, super_mean, all_mean, nw
 
     def build_alpha_from_pattern(self, atom_name: str, mean_slope: float) -> list[str]:
-        """斜率因子 + 沿时间的加速度（对已定方向的 ``alpha_slope`` 做 diff）。"""
+        """斜率因子 + 加速度 + 按日截面斜率分位秩 ``alpha_slope_<atom>_rank``。"""
         direction = -1.0 if mean_slope < 0 else 1.0
         alpha_slope = f"alpha_slope_{atom_name}"
         alpha_accel = f"alpha_accel_{atom_name}"
+        alpha_slope_rank = f"alpha_slope_{atom_name}_rank"
 
         def _grp_slope(s: pd.Series) -> pd.Series:
             return rolling_ols_slope(pd.to_numeric(s, errors="coerce"), self.slope_window)
@@ -324,8 +369,11 @@ class AlphaSearchlight:
         slopes = self.df.groupby("stock_code", sort=False)[atom_name].transform(_grp_slope)
         self.df[alpha_slope] = slopes * direction
         self.df[alpha_accel] = self.df.groupby("stock_code", sort=False)[alpha_slope].diff()
+        self.df[alpha_slope_rank] = self.df.groupby("date", sort=False)[alpha_slope].rank(
+            method="average", pct=True
+        )
 
-        cols_out = [alpha_slope, alpha_accel]
+        cols_out = [alpha_slope, alpha_accel, alpha_slope_rank]
         self.last_valid_alphas.extend(cols_out)
         return cols_out
 

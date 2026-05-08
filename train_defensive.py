@@ -37,7 +37,7 @@ from features import (
 )
 from regime import REGIME_FEATURE_COLUMNS
 
-# Searchlight：与 ``features.SEARCHLIGHT_COLUMNS`` 一致（斜率 + 加速度）。
+# Searchlight：与 ``features.SEARCHLIGHT_COLUMNS`` 一致（斜率 + 加速度 + 斜率截面分位秩）。
 DEFENSIVE_SEARCHLIGHT_COLUMNS: tuple[str, ...] = SEARCHLIGHT_COLUMNS
 
 # ---------------------------------------------------------------------------
