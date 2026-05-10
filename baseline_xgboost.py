@@ -152,7 +152,7 @@ def build_portfolio(scores: pd.Series, top_k: int = DEFAULT_TOP_K) -> pd.Series:
             f"(need >= {MIN_STOCKS} per competition rule)."
         )
 
-    ranks = np.arange(n, 0, -1, dtype=float)
+    ranks = np.exp(np.linspace(2, 0, n))
     w = pd.Series(ranks / ranks.sum(), index=chosen.index)
 
     for _ in range(50):

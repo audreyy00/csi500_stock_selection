@@ -91,7 +91,7 @@ FEATURE_COLUMNS = [
     "ret_1d", "ret_5d", "ret_10d", "ret_20d", "ret_60d",
     "vol_20d", "volume_z_20d", "turnover_ma_20d",
     "close_over_ma20", "close_over_ma60", "rsi_14",
-    "ret_3d_rank", "ret_5d_rank", "ret_20d_rank", "vol_20d_rank",
+    "ret_3d_rank", "ret_5d_rank", "ret_20d_rank", "vol_20d_rank","vol_pct_60d",
     # *ANALYST_FEATURE_COLUMNS,
     *REGIME_FEATURE_COLUMNS,
     *SEARCHLIGHT_COLUMNS,
@@ -337,6 +337,10 @@ def _cross_sectional_ranks(panel: pd.DataFrame) -> pd.DataFrame:
         panel[f"{base}_rank"] = (
             panel.groupby("date")[base].rank(method="average", pct=True)
         )
+    # 波动率收缩：当前vol相对自身60日历史的分位
+    panel["vol_pct_60d"] = panel.groupby("stock_code")["vol_20d"].transform(
+        lambda x: x.rolling(60, min_periods=30).rank(pct=True)
+    )
     return panel
 
 

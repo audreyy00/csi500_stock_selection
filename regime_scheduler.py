@@ -71,7 +71,17 @@ def build_regime_features(prices: pd.DataFrame, index_df: pd.DataFrame) -> pd.Da
         xs_dispersion_1d=("ret_1d", _disp),
         xs_breadth_1d=("ret_1d", _breadth),
     )
-    out = idx.set_index("date")[["idx_mom_5d", "idx_mom_20d", "idx_vol_20d"]].join(cs, how="inner")
+    # 指数10日动量
+    idx["idx_mom_10d"] = c / c.shift(10) - 1.0
+
+    # 成交量相对强度：当日成交量 / 20日均量
+    vol_idx = pd.to_numeric(idx["volume"], errors="coerce") if "volume" in idx.columns else None
+    if vol_idx is not None:
+        idx["idx_vol_ratio"] = vol_idx / vol_idx.rolling(20, min_periods=10).mean()
+
+    # 涨跌宽度5日均值（更稳定）
+    cs["xs_breadth_5d"] = cs["xs_breadth_1d"].rolling(5, min_periods=3).mean()
+    out = idx.set_index("date")[["idx_mom_5d", "idx_mom_10d", "idx_mom_20d", "idx_vol_20d"]].join(cs, how="inner")
     out = out.replace([np.inf, -np.inf], np.nan).dropna()
     return out
 
@@ -180,26 +190,28 @@ def cmd_train(args: argparse.Namespace) -> None:
         pb = work / f"sched_b_{cal}.csv"
         pd_ = work / f"sched_d_{cal}.csv"
         try:
-            run_model_csv(
-                script="baseline_xgboost.py",
-                as_of=cal,
-                out_csv=pb,
-                python_exe=args.python,
-                top_k=args.top_k,
-                prices=prices_path,
-                index_p=None,
-                quiet=args.quiet,
-            )
-            run_model_csv(
-                script="train_defensive.py",
-                as_of=cal,
-                out_csv=pd_,
-                python_exe=args.python,
-                top_k=args.top_k,
-                prices=prices_path,
-                index_p=index_path,
-                quiet=args.quiet,
-            )
+            if not pb.is_file():
+                run_model_csv(
+                    script="baseline_xgboost.py",
+                    as_of=cal,
+                    out_csv=pb,
+                    python_exe=args.python,
+                    top_k=args.top_k,
+                    prices=prices_path,
+                    index_p=None,
+                    quiet=args.quiet,
+                )
+            if not pd_.is_file():
+                run_model_csv(
+                    script="train_defensive.py",
+                    as_of=cal,
+                    out_csv=pd_,
+                    python_exe=args.python,
+                    top_k=args.top_k,
+                    prices=prices_path,
+                    index_p=index_path,
+                    quiet=args.quiet,
+                )
         except Exception:
             tqdm.write(f"[skip] train failed at {cal}")
             continue
@@ -223,7 +235,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         row["delta_ra_minus_rd"] = delta
         label_rows.append(row)
 
-    if len(label_rows) < 30:
+    if len(label_rows) < 15:
         raise RuntimeError(f"标签样本过少 ({len(label_rows)}）—放宽日期、e 或减小 stride。")
 
     lab = pd.DataFrame(label_rows).set_index("date").sort_index()
@@ -395,7 +407,7 @@ def main() -> None:
     pd_.add_argument("--python", default=sys.executable)
     pd_.set_defaults(_fn=cmd_decide)
 
-    args = ap.parse_args()
+    args = ap.parse_args() 
     if args.cmd == "decide":
         bundle = joblib.load(Path(args.bundle))
         if args.p_attack_high is None:
